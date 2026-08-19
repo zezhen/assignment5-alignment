@@ -9,7 +9,6 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
 
-
 def run_tokenize_prompt_and_output(
     prompt_strs: list[str],
     output_strs: list[str],
@@ -46,7 +45,49 @@ def run_tokenize_prompt_and_output(
                 with labels, with value 1 where the corresponding label token
                 is part of the response and 0 otherwise.
     """
-    raise NotImplementedError
+    assert len(prompt_strs) == len(output_strs)
+
+    tokenized_data = [
+        (tokenizer.encode(prompt), tokenizer.encode(output))
+        for prompt, output in zip(prompt_strs, output_strs)
+    ]
+
+    max_prompt_and_output_len = (
+        max([len(data[0]) + len(data[1]) for data in tokenized_data]) - 1
+    )
+
+    def pad(tensor):
+        if len(tensor) < max_prompt_and_output_len:
+            tensor = torch.concat(
+                [
+                    tensor,
+                    torch.zeros(
+                        max_prompt_and_output_len - len(tensor), dtype=torch.long
+                    ),
+                ]
+            )
+        if len(tensor) > max_prompt_and_output_len:
+            tensor = tensor[:max_prompt_and_output_len]
+
+        return tensor
+
+    input_ids = []
+    labels = []
+    masks = []
+    for data in tokenized_data:
+        input_id = torch.tensor(data[0] + data[1], dtype=torch.long)
+        label = input_id[1:]
+        mask = torch.concat([torch.zeros(len(data[0]) - 1), torch.ones(len(data[1]))])
+
+        input_ids.append(pad(input_id))
+        labels.append(pad(label))
+        masks.append(pad(mask))
+
+    return {
+        "input_ids": torch.stack(input_ids),
+        "labels": torch.stack(labels),
+        "response_mask": torch.stack(masks),
+    }
 
 
 def run_get_response_log_probs(
@@ -82,13 +123,30 @@ def run_get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    raise NotImplementedError
+    ret = model(input_ids=input_ids, labels=labels)
+    all_log_probs = torch.log_softmax(ret.logits, dim=-1)
+    log_probs = torch.gather(
+        all_log_probs,
+        dim=-1,
+        index=labels.unsqueeze(-1),
+    ).squeeze(-1)
+    outputs: dict[str, Tensor] = {
+        "log_probs": log_probs,
+    }
+
+    if return_token_entropy:
+        probs = all_log_probs.exp()
+        token_entropy = -(probs * all_log_probs).sum(dim=-1)
+        outputs["token_entropy"] = token_entropy
+
+    return outputs
 
 
 def run_compute_rollout_rewards(
     reward_fn: Callable[[str, str], dict[str, float]],
     rollout_responses: list[str],
     repeated_ground_truths: list[str],
+    prompt_name: str,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute rewards for a list of rollout responses, along with metadata for
     the reward components.
@@ -114,7 +172,22 @@ def run_compute_rollout_rewards(
                 Reward statistics to log. At minimum, include the mean total
                 and format rewards over the rollout batch.
     """
-    raise NotImplementedError
+    assert len(rollout_responses) == len(repeated_ground_truths)
+
+    raw_rewards = []
+    format_rewards = []
+    for response, gt in zip(rollout_responses, repeated_ground_truths):
+        reward_output = reward_fn(prompt_name, response, gt)
+        raw_rewards.append(reward_output["reward"])
+        format_rewards.append(reward_output["format_reward"])
+
+    return (
+        torch.tensor(raw_rewards),
+        {
+            "meam_total_reward": sum(raw_rewards) / len(raw_rewards),
+            "mean_format_reward": sum(format_rewards) / len(format_rewards),
+        },
+    )
 
 
 def run_compute_group_normalized_rewards(
@@ -153,7 +226,31 @@ def run_compute_group_normalized_rewards(
                 your choice of other statistics to log (e.g. mean, std, max/min
                 of rewards).
     """
-    raise NotImplementedError
+    grouped_rewards = raw_rewards.reshape(-1, group_size)
+
+    if advantage_normalizer == "std":
+        reward_norm = grouped_rewards.std(dim=1, keepdim=True)
+    elif advantage_normalizer == "mean":
+        reward_norm = grouped_rewards.mean(dim=1, keepdim=True)
+    else:
+        reward_norm = torch.ones_like(grouped_rewards[:, :1])
+
+    if baseline == "mean":
+        reward_baseline = grouped_rewards.mean(dim=1, keepdim=True)
+    else:
+        reward_baseline = torch.zeros_like(grouped_rewards[:, :1])
+
+    advantages = (grouped_rewards - reward_baseline) / (reward_norm + advantage_eps)
+
+    return (
+        advantages.flatten(),
+        {
+            "mean": grouped_rewards.mean(),
+            "std": grouped_rewards.std(),
+            "max": grouped_rewards.max(),
+            "min": grouped_rewards.min(),
+        },
+    )
 
 
 def run_compute_policy_gradient_loss(
@@ -200,7 +297,12 @@ def run_compute_policy_gradient_loss(
                 Statistics from the underlying loss call, such as
                 clip-fraction components.
     """
-    raise NotImplementedError
+    if importance_reweighting_method == "none":
+        loss = -raw_rewards_or_advantages.reshape(-1, 1) * policy_log_probs
+    else:
+        raise NotImplementedError
+
+    return (loss, {})
 
 
 def run_aggregate_loss_across_microbatch(
@@ -232,7 +334,15 @@ def run_aggregate_loss_across_microbatch(
             A scalar containing the average loss. Make sure you can later call
             backward on this loss.
     """
-    raise NotImplementedError
+    loss = per_token_policy_gradient_loss * mask
+
+    if loss_normalization == "constant":
+        assert normalization_constant is not None
+        loss /= normalization_constant
+    elif loss_normalization == "sequence":
+        loss = loss.sum(dim=1) / mask.sum(dim=1)
+
+    return loss.mean()
 
 
 def run_grpo_train_step(
@@ -241,6 +351,7 @@ def run_grpo_train_step(
     optimizer: torch.optim.Optimizer,
     gradient_accumulation_steps: int,
     max_grad_norm: float | None,
+    prompt_name: str,
     reward_fn: Callable[[str, str], dict[str, float]],
     repeated_prompts: list[str],
     rollout_responses: list[str],
@@ -321,11 +432,83 @@ def run_grpo_train_step(
                 Dict with metadata from the underlying loss call, gradient norm
                 before clipping, and any other statistics you might want to log.
     """
-    raise NotImplementedError
+
+    tokenizer_outputs = run_tokenize_prompt_and_output(
+        repeated_prompts, rollout_responses, tokenizer
+    )
+    input_ids = tokenizer_outputs["input_ids"]
+    labels = tokenizer_outputs["labels"]
+    response_mask = tokenizer_outputs["response_mask"]
+
+    rewards, reward_metadata = run_compute_rollout_rewards(
+        reward_fn, prompt_name, rollout_responses, repeated_ground_truths
+    )
+
+    advantages, advantages_metadata = run_compute_group_normalized_rewards(
+        rewards, group_size, baseline, advantage_eps, advantage_normalizer
+    )
+
+    batch_size = input_ids.size(0)
+    microbatch_size = batch_size // gradient_accumulation_steps
+
+    optimizer.zero_grad(set_to_none=True)
+    metadata = {}
+
+    total_loss = 0.0
+    for mb in range(gradient_accumulation_steps):
+        mb_start = mb * microbatch_size
+        mb_end = mb_start + microbatch_size
+
+        mb_input_ids = input_ids[mb_start:mb_end]
+        mb_labels = labels[mb_start:mb_end]
+
+        model_outputs = run_get_response_log_probs(
+            model, mb_input_ids, mb_labels, False
+        )
+        log_probs = model_outputs["log_probs"]
+
+        mb_old_log_probs = (
+            old_log_probs[mb_start:mb_end] if old_log_probs is not None else None
+        )
+
+        pg_loss, pg_loss_metadata = run_compute_policy_gradient_loss(
+            advantages[mb_start:mb_end],
+            log_probs,
+            importance_reweighting_method,
+            mb_old_log_probs,
+            cliprange,
+            response_mask[mb_start:mb_end],
+        )
+
+        loss = run_aggregate_loss_across_microbatch(
+            pg_loss,
+            response_mask[mb_start:mb_end],
+            loss_normalization,
+            normalization_constant,
+        )
+
+        loss = loss / gradient_accumulation_steps
+        loss.backward()
+        total_loss += loss.detach()
+
+    grad_norm = None
+    if max_grad_norm is not None:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_grad_norm,
+        )
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    metadata.update(reward_metadata)
+    metadata.update(advantages_metadata)
+    metadata["grad_norm"] = grad_norm
+
+    return (total_loss, metadata)
 
 
 """
-The below adapters are used in the optional 
+The below adapters are used in the optional
 RLHF / safety part of the Alignment assignment.
 """
 
