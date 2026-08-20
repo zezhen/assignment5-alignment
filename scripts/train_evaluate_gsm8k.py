@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 from cs336_alignment.adapters import run_grpo_train_step, run_sft_train_step
-from cs336_alignment.checkpoint import get_model_and_tokenizer
+from cs336_alignment.checkpoint import get_model_and_tokenizer, save_model_and_tokenizer
 from cs336_alignment.drgrpo_grader import extract_answer, grade
 from cs336_alignment.vllm_utils import (
     generate_completions,
@@ -172,14 +172,14 @@ def run_sft_train(
     assert len(prompts) == len(examples)
     responses = [extract_response(example) for example in examples]
 
-    print()
-    print("=" * 80)
-    print(f"prompt example: {prompts[0]}")
-    print(f"response example: {responses[0]}")
-    print("=" * 80)
+    # print()
+    # print("=" * 80)
+    # print(f"prompt example: {prompts[0]}")
+    # print(f"response example: {responses[0]}")
+    # print("=" * 80)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=1e-5, betas=(0.9, 0.95), weight_decay=0.0
+        model.parameters(), lr=5e-5, betas=(0.9, 0.95), weight_decay=1e-6
     )
 
     print()
@@ -285,8 +285,12 @@ def run_grpo_train(
 
     print()
     print("=" * 80)
+    print(f"Complete {prompt_name} grpo training, {total_loss=}")
     print(
-        f"Complete {prompt_name} grpo training, {total_loss=}, reward={metadata['reward']}, adv_mean={metadata['adv_mean']}, adv_std={metadata['adv_std']}, adv_max={metadata['adv_max']}, adv_min={metadata['adv_min']}"
+        f"Rewards: reward_mean={metadata['reward_mean']}, reward_std={metadata['reward_std']}, reward_max={metadata['reward_max']}, reward_min={metadata['reward_min']}"
+    )
+    print(
+        f"Advantages: adv_mean={metadata['adv_mean']}, adv_std={metadata['adv_std']}, adv_max={metadata['adv_max']}, adv_min={metadata['adv_min']}"
     )
     print("=" * 80)
 
@@ -331,6 +335,11 @@ def main():
     parser.add_argument("--rollouts", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--sync-policy-weight", type=bool, default=False)
+    parser.add_argument("--save", type=bool, default=False)
+    parser.add_argument(
+        "--ref-model",
+        default="/home/zezhen/.cache/huggingface/hub/models--allenai--OLMo-2-0425-1B/snapshots/a1847dff35000b4271fa70afc5db10fd29fedbdf",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -373,8 +382,7 @@ def main():
             print(f"Start load model")
             print("=" * 80)
 
-            model_id_or_dir = "/home/zezhen/.cache/huggingface/hub/models--allenai--OLMo-2-0425-1B/snapshots/a1847dff35000b4271fa70afc5db10fd29fedbdf"
-            model, tokenizer = get_model_and_tokenizer(model_id_or_dir, "cuda")
+            model, tokenizer = get_model_and_tokenizer(args.ref_model, "cuda")
 
             for batch, prompts in enumerate(prompt_batches):
                 if args.sft_training:
@@ -423,6 +431,14 @@ def main():
                     args.gradient_accumulation_steps,
                     args.sync_policy_weight,
                 )
+
+            if args.save:
+                print()
+                print("=" * 80)
+                print(f"save latest model and tokenizer to {args.output_dir}")
+                print("=" * 80)
+                save_model_and_tokenizer(model, tokenizer, args.output_dir)
+
             continue
 
         completions: list[VLLMCompletion] = generate_completions(

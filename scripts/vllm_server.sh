@@ -15,7 +15,8 @@ set -uo pipefail
 # SERVED_MODEL_NAME decouples the API-facing id from that path: without it the
 # only accepted "model" value is the full snapshot path, and clients sending the
 # familiar hub id get a 404.
-MODEL_ID="${MODEL_ID:-/home/zezhen/.cache/huggingface/hub/models--allenai--OLMo-2-0425-1B/snapshots/a1847dff35000b4271fa70afc5db10fd29fedbdf}"
+# MODEL_ID="${MODEL_ID:-/home/zezhen/.cache/huggingface/hub/models--allenai--OLMo-2-0425-1B/snapshots/a1847dff35000b4271fa70afc5db10fd29fedbdf}"
+MODEL_ID="${MODEL_ID:-/home/zezhen/assignment5-alignment/outputs/OLMo-2-0425-1B-sft-v1}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-allenai/OLMo-2-0425-1B}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
@@ -31,6 +32,7 @@ SHUTDOWN_TIMEOUT="${SHUTDOWN_TIMEOUT:-30}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${REPO_ROOT}/outputs/vllm"
 LOG_FILE="${LOG_DIR}/server_${PORT}.log"
+PGID_FILE="${LOG_DIR}/server_${PORT}.pgid"
 
 # Serve from the repo's own .venv. pyproject pins vllm==0.19.1, which is what
 # the training script imports; NCCL weight transfer is a handshake between the
@@ -76,8 +78,22 @@ REQUIRED_ROUTES=(
 log() { printf '[vllm_server] %s\n' "$*"; }
 die() { printf '[vllm_server] error: %s\n' "$*" >&2; exit 1; }
 
+# The API server's cmdline matches PKILL_PATTERN, but its EngineCore child
+# overwrites its process title to "VLLM::EngineCore" and matches nothing. If the
+# parent dies alone, that child is reparented to init and keeps its ~74 GiB of
+# GPU memory forever, invisible to any cmdline-based lookup. Track the setsid
+# process group instead, which covers the whole tree.
+server_pgid() {
+  [[ -r "${PGID_FILE}" ]] && cat "${PGID_FILE}" 2>/dev/null
+}
+
 server_pids() {
-  pgrep -f "${PKILL_PATTERN}" 2>/dev/null
+  {
+    pgrep -f "${PKILL_PATTERN}" 2>/dev/null
+    local pgid
+    pgid="$(server_pgid)"
+    [[ -n "${pgid}" ]] && pgrep -g "${pgid}" 2>/dev/null
+  } | sort -un
 }
 
 health_ok() {
@@ -105,6 +121,14 @@ for route in required:
 do_start() {
   if health_ok; then
     die "something is already serving ${BASE_URL} (pids: $(server_pids | tr '\n' ' ')). Run 'stop' or 'restart' first."
+  fi
+
+  # Nothing is answering /health, but a leftover EngineCore can still be holding
+  # the GPU. Starting on top of it fails with "Free memory on device ... is less
+  # than desired GPU memory utilization", so clear it out first.
+  if [[ -n "$(server_pids)" ]]; then
+    log "no healthy server, but found leftover pids: $(server_pids | tr '\n' ' ') -- cleaning up"
+    do_stop
   fi
 
   mkdir -p "${LOG_DIR}"
@@ -144,6 +168,10 @@ do_start() {
     --load-format "${LOAD_FORMAT}" \
     >>"${LOG_FILE}" 2>&1 &
 
+  # setsid makes the server its own process-group leader, so its pid is the pgid
+  # that every descendant (EngineCore included) inherits.
+  ps -o pgid= -p "$!" 2>/dev/null | tr -d ' ' >"${PGID_FILE}"
+
   local deadline=$((SECONDS + STARTUP_TIMEOUT))
   while ((SECONDS < deadline)); do
     if health_ok; then
@@ -163,27 +191,39 @@ do_start() {
   die "timed out after ${STARTUP_TIMEOUT}s waiting for ${BASE_URL}/health"
 }
 
+# Signal the whole process group, then the pattern matches, so an EngineCore
+# orphaned by a dead API server still gets reaped and releases its GPU memory.
+signal_server() {
+  local sig="$1" pgid
+  pgid="$(server_pgid)"
+  [[ -n "${pgid}" ]] && kill "-${sig}" -- "-${pgid}" 2>/dev/null
+  pkill "-${sig}" -f "${PKILL_PATTERN}" 2>/dev/null
+  return 0
+}
+
 do_stop() {
   local pids
   pids="$(server_pids)"
   if [[ -z "${pids}" ]]; then
-    log "no server matching '${PKILL_PATTERN}'"
+    log "no server matching '${PKILL_PATTERN}' or pgid $(server_pgid)"
+    rm -f "${PGID_FILE}"
     return 0
   fi
 
   log "SIGTERM -> pids: $(echo "${pids}" | tr '\n' ' ')"
-  pkill -TERM -f "${PKILL_PATTERN}"
+  signal_server TERM
 
   local deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
   while ((SECONDS < deadline)); do
-    [[ -z "$(server_pids)" ]] && { log "stopped"; return 0; }
+    [[ -z "$(server_pids)" ]] && { log "stopped"; rm -f "${PGID_FILE}"; return 0; }
     sleep 1
   done
 
   log "still alive after ${SHUTDOWN_TIMEOUT}s, sending SIGKILL"
-  pkill -KILL -f "${PKILL_PATTERN}"
+  signal_server KILL
   sleep 2
   [[ -z "$(server_pids)" ]] || die "failed to kill $(server_pids | tr '\n' ' ')"
+  rm -f "${PGID_FILE}"
   log "stopped (SIGKILL)"
 }
 

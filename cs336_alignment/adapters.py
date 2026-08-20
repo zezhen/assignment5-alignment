@@ -246,10 +246,14 @@ def run_compute_group_normalized_rewards(
     return (
         advantages.flatten().to(device="cuda"),
         {
-            "adv_mean": grouped_rewards.mean(),
-            "adv_std": grouped_rewards.std(),
-            "adv_max": grouped_rewards.max(),
-            "adv_min": grouped_rewards.min(),
+            "reward_mean": grouped_rewards.mean(),
+            "reward_std": grouped_rewards.std(),
+            "reward_max": grouped_rewards.max(),
+            "reward_min": grouped_rewards.min(),
+            "adv_mean": advantages.mean(),
+            "adv_std": advantages.std(),
+            "adv_max": advantages.max(),
+            "adv_min": advantages.min(),
         },
     )
 
@@ -520,6 +524,7 @@ def run_sft_train_step(
     tokenizer_outputs = run_tokenize_prompt_and_output(prompts, responses, tokenizer)
     input_ids = tokenizer_outputs["input_ids"]
     labels = tokenizer_outputs["labels"]
+    response_mask = tokenizer_outputs["response_mask"]
 
     batch_size = input_ids.size(0)
     microbatch_size = batch_size // gradient_accumulation_steps
@@ -534,13 +539,14 @@ def run_sft_train_step(
 
         mb_input_ids = input_ids[mb_start:mb_end]
         mb_labels = labels[mb_start:mb_end]
+        mb_mask = response_mask[mb_start:mb_end]
 
         model_outputs = run_get_response_log_probs(
             model, mb_input_ids, mb_labels, False
         )
         log_probs = model_outputs["log_probs"]
 
-        loss = -log_probs
+        loss = -log_probs * mb_mask
 
         loss = loss.mean() / gradient_accumulation_steps
         loss.backward()
