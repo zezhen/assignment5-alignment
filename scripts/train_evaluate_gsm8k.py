@@ -162,30 +162,18 @@ def category(fmt: int, correct: int):
 def run_sft_train(
     model: torch.nn.Module,
     tokenizer: PreTrainedTokenizerBase,
+    optimizer: torch.optim.Optimizer,
     prompt_name: str,
     prompts: list[str],
     examples: list[str],
     gradient_accumulation_steps: int,
     enable_sync_policy_weights: bool,
     vllm_base_url: str | None,
+    batch: int,
+    epoch: int,
 ):
     assert len(prompts) == len(examples)
     responses = [extract_response(example) for example in examples]
-
-    # print()
-    # print("=" * 80)
-    # print(f"prompt example: {prompts[0]}")
-    # print(f"response example: {responses[0]}")
-    # print("=" * 80)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=5e-5, betas=(0.9, 0.95), weight_decay=1e-6
-    )
-
-    print()
-    print("=" * 80)
-    print(f"Start training {len(prompts)} examples")
-    print("=" * 80)
 
     total_loss, metadata = run_sft_train_step(
         model,
@@ -197,25 +185,11 @@ def run_sft_train(
         max_grad_norm=1.0,
     )
 
-    print()
-    print("=" * 80)
-    print(f"Complete {prompt_name} sft training, {total_loss=}")
-    print("=" * 80)
+    print(f"sft training batch {batch},epoch={epoch}, loss={total_loss.item()}")
 
     if enable_sync_policy_weights:
-        print()
-        print("=" * 80)
-        print(f"Start sync policy weight to {vllm_base_url}")
-        print("=" * 80)
-
         weight_sync_group = init_weight_sync(vllm_base_url, "cuda:0")
         sync_policy_weights(model, vllm_base_url, weight_sync_group)
-
-        print()
-        print("=" * 80)
-        print(f"Complete sync policy weight")
-        print("=" * 80)
-
 
 def run_grpo_train(
     model: torch.nn.Module,
@@ -348,7 +322,7 @@ def main():
 
     args = parser.parse_args()
 
-    data = load_jsonl(GSM8K_TRAIN if args.sft_training else GSM8K_TEST)
+    data = load_jsonl(GSM8K_TRAIN if args.sft_training or args.grpo_training else GSM8K_TEST)
     if args.limit is not None:
         data = data[: args.limit]
 
@@ -383,54 +357,61 @@ def main():
             print("=" * 80)
 
             model, tokenizer = get_model_and_tokenizer(args.ref_model, "cuda")
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=5e-5, betas=(0.9, 0.95), weight_decay=1e-6
+            )
 
-            for batch, prompts in enumerate(prompt_batches):
-                if args.sft_training:
-                    run_sft_train(
+            for epoch in range(args.rollouts):
+                for batch, prompts in enumerate(prompt_batches):
+                    if args.sft_training:
+                        run_sft_train(
+                            model,
+                            tokenizer,
+                            optimizer,
+                            prompt_name,
+                            prompts,
+                            data_batches[batch],
+                            args.gradient_accumulation_steps,
+                            args.sync_policy_weight,
+                            args.base_url,
+                            batch,
+                            epoch,
+                        )
+                        continue
+
+                    print()
+                    print("=" * 80)
+                    print(
+                        f"Generate completion for batch: {batch} with {len(prompts)} prompts and {args.rollouts} rollouts, total {len(prompt_batches)} batches"
+                    )
+                    print("=" * 80)
+                    rollout_completions = []
+                    for rollout in range(args.rollouts):
+                        completions: list[VLLMCompletion] = generate_completions(
+                            vllm_base_url=args.base_url,
+                            model_id=args.model,
+                            prompts=prompts,
+                            sampling_params={
+                                "temperature": args.temperature,
+                                "max_tokens": args.max_tokens,
+                                "n": 1,
+                                "seed": args.seed,
+                            },
+                            # batch_size=args.batch_size,
+                        )
+                        rollout_completions.append(completions)
+                    run_grpo_train(
                         model,
                         tokenizer,
                         prompt_name,
                         prompts,
+                        rollout_completions,
                         data_batches[batch],
+                        args.base_url,
+                        args.rollouts,
                         args.gradient_accumulation_steps,
                         args.sync_policy_weight,
-                        args.base_url,
                     )
-                    continue
-
-                print()
-                print("=" * 80)
-                print(
-                    f"Generate completion for batch: {batch} with {len(prompts)} prompts and {args.rollouts} rollouts, total {len(prompt_batches)} batches"
-                )
-                print("=" * 80)
-                rollout_completions = []
-                for rollout in range(args.rollouts):
-                    completions: list[VLLMCompletion] = generate_completions(
-                        vllm_base_url=args.base_url,
-                        model_id=args.model,
-                        prompts=prompts,
-                        sampling_params={
-                            "temperature": args.temperature,
-                            "max_tokens": args.max_tokens,
-                            "n": 1,
-                            "seed": args.seed,
-                        },
-                        # batch_size=args.batch_size,
-                    )
-                    rollout_completions.append(completions)
-                run_grpo_train(
-                    model,
-                    tokenizer,
-                    prompt_name,
-                    prompts,
-                    rollout_completions,
-                    data_batches[batch],
-                    args.base_url,
-                    args.rollouts,
-                    args.gradient_accumulation_steps,
-                    args.sync_policy_weight,
-                )
 
             if args.save:
                 print()
