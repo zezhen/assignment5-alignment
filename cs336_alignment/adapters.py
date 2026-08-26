@@ -123,15 +123,17 @@ def run_get_response_log_probs(
                 entropy for each position (present only if
                 return_token_entropy=True).
     """
-    ret = model(input_ids=input_ids, labels=labels)
+    ret = model(input_ids=input_ids)
+    # it's more precise to use fp32 with large memory cost, as ret.logits is in shape [B,T,V],
     all_log_probs = torch.log_softmax(ret.logits, dim=-1)
     log_probs = torch.gather(
         all_log_probs,
         dim=-1,
         index=labels.unsqueeze(-1),
     ).squeeze(-1)
+
     outputs: dict[str, Tensor] = {
-        "log_probs": log_probs,
+        "log_probs": log_probs.float(),
     }
 
     if return_token_entropy:
@@ -175,16 +177,21 @@ def run_compute_rollout_rewards(
     assert len(rollout_responses) == len(repeated_ground_truths)
 
     raw_rewards = []
+    answer_rewards = []
     format_rewards = []
     for response, gt in zip(rollout_responses, repeated_ground_truths):
         reward_output = reward_fn(prompt_name, response, gt)
-        raw_rewards.append(reward_output["reward"])
+        raw_rewards.append(reward_output["reward"] + 0.1 * reward_output["format_reward"])
+        answer_rewards.append(reward_output["reward"])
         format_rewards.append(reward_output["format_reward"])
 
     return (
         torch.tensor(raw_rewards),
         {
             "reward": raw_rewards,
+            # Unshaped correctness, kept separate so pass@k stays well defined
+            # if the shaping weights ever change.
+            "answer_rewards": answer_rewards,
             "meam_total_reward": sum(raw_rewards) / len(raw_rewards),
             "mean_format_reward": sum(format_rewards) / len(format_rewards),
         },
@@ -304,6 +311,10 @@ def run_compute_policy_gradient_loss(
     """
     if importance_reweighting_method == "none":
         loss = -raw_rewards_or_advantages.reshape(-1, 1) * policy_log_probs
+    elif importance_reweighting_method == "grpo":
+        ratio = torch.exp(policy_log_probs - old_log_probs.to(policy_log_probs.device))
+        advantages = raw_rewards_or_advantages.reshape(-1, 1)
+        loss = - torch.min(ratio * advantages, torch.clamp(ratio, 1-cliprange, 1+cliprange)* advantages)
     else:
         raise NotImplementedError
 
@@ -345,7 +356,9 @@ def run_aggregate_loss_across_microbatch(
         assert normalization_constant is not None
         loss /= normalization_constant
     elif loss_normalization == "sequence":
-        loss = loss.sum(dim=1) / mask.sum(dim=1)
+        # clamp: an empty rollout has no unmasked position, and 0/0 would poison
+        # every parameter with NaN on the next backward.
+        loss = loss.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
 
     return loss.mean()
 
@@ -370,6 +383,10 @@ def run_grpo_train_step(
     cliprange: float | None = None,
     loss_normalization: Literal["sequence", "constant"] = "sequence",
     normalization_constant: int | None = None,
+    epochs: int = 1,
+    batch: dict[str, Tensor] | None = None,
+    vllm_log_probs: torch.Tensor | None = None,
+    tis_clip: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
     """Execute forward-and-backward passes, with gradient_accumulation_steps
     microbatches.
@@ -427,6 +444,23 @@ def run_grpo_train_step(
         normalization_constant: int | None = None
             The constant to divide total loss by; required if
             loss_normalization = "constant".
+        epochs: int = 1
+            Number of inner passes over this rollout batch, i.e. PPO epochs.
+            One optimizer step per epoch. Clipping only does anything when this
+            is > 1, because on the first pass the ratio is identically 1.
+        batch: dict[str, Tensor] | None = None
+            Pre-tokenized {"input_ids", "labels", "response_mask"}. When given,
+            the string arguments are used only for reward computation. Pass this
+            to build the batch from the inference engine's own token ids instead
+            of re-tokenizing the decoded text.
+        vllm_log_probs: torch.Tensor | None = None
+            Shape (batch_size, sequence_length), per-token log-probs reported by
+            the inference engine that actually sampled the rollouts. Used only
+            for the truncated-importance-sampling correction.
+        tis_clip: float | None = None
+            Upper bound on the truncated-importance-sampling weight. None
+            disables truncation; the weight itself is only applied when
+            vllm_log_probs is given.
 
     Returns:
         tuple[torch.Tensor, dict[str, torch.Tensor]].
@@ -438,12 +472,13 @@ def run_grpo_train_step(
                 before clipping, and any other statistics you might want to log.
     """
 
-    tokenizer_outputs = run_tokenize_prompt_and_output(
-        repeated_prompts, rollout_responses, tokenizer
-    )
-    input_ids = tokenizer_outputs["input_ids"]
-    labels = tokenizer_outputs["labels"]
-    response_mask = tokenizer_outputs["response_mask"]
+    if batch is None:
+        batch = run_tokenize_prompt_and_output(
+            repeated_prompts, rollout_responses, tokenizer
+        )
+    input_ids = batch["input_ids"]
+    labels = batch["labels"]
+    response_mask = batch["response_mask"]
 
     rewards, reward_metadata = run_compute_rollout_rewards(
         reward_fn, rollout_responses, repeated_ground_truths, prompt_name
@@ -456,60 +491,110 @@ def run_grpo_train_step(
     batch_size = input_ids.size(0)
     microbatch_size = batch_size // gradient_accumulation_steps
 
-    optimizer.zero_grad(set_to_none=True)
+    # pi_old is the behaviour policy. Measure it with our own forward pass rather
+    # than reusing the inference engine's log-probs: identical weights still give
+    # different numbers under vLLM's kernels, and folding that gap into the PPO
+    # ratio would make it != 1 on the first inner epoch and trip the clip on
+    # tokens the policy never moved. The engine gap is corrected separately below.
+    if importance_reweighting_method != "none" and old_log_probs is None:
+        with torch.no_grad():
+            old_log_probs = torch.cat(
+                [
+                    run_get_response_log_probs(
+                        model,
+                        input_ids[start : start + microbatch_size],
+                        labels[start : start + microbatch_size],
+                        False,
+                    )["log_probs"]
+                    for start in range(0, batch_size, microbatch_size)
+                ]
+            )
+
+    # Truncated importance sampling: the rollouts really were drawn from the
+    # inference engine, so reweight by pi_old/pi_engine. Truncating bounds the
+    # variance the tail of that ratio would otherwise inject.
+    tis_weights = None
+    if vllm_log_probs is not None and old_log_probs is not None:
+        tis_weights = torch.exp(
+            old_log_probs - vllm_log_probs.to(old_log_probs.device)
+        ).detach()
+        if tis_clip is not None:
+            tis_weights = tis_weights.clamp(max=tis_clip)
+
     metadata = {}
+    epoch_losses = []
+    epoch_grad_norms = []
 
-    total_loss = 0.0
-    for mb in range(gradient_accumulation_steps):
-        mb_start = mb * microbatch_size
-        mb_end = mb_start + microbatch_size
+    for _ in range(max(epochs, 1)):
+        optimizer.zero_grad(set_to_none=True)
 
-        mb_input_ids = input_ids[mb_start:mb_end]
-        mb_labels = labels[mb_start:mb_end]
+        total_loss = 0.0
+        for mb in range(gradient_accumulation_steps):
+            mb_start = mb * microbatch_size
+            mb_end = mb_start + microbatch_size
 
-        model_outputs = run_get_response_log_probs(
-            model, mb_input_ids, mb_labels, False
-        )
-        log_probs = model_outputs["log_probs"]
+            mb_input_ids = input_ids[mb_start:mb_end]
+            mb_labels = labels[mb_start:mb_end]
 
-        mb_old_log_probs = (
-            old_log_probs[mb_start:mb_end] if old_log_probs is not None else None
-        )
+            model_outputs = run_get_response_log_probs(
+                model, mb_input_ids, mb_labels, False
+            )
+            log_probs = model_outputs["log_probs"]
 
-        pg_loss, pg_loss_metadata = run_compute_policy_gradient_loss(
-            advantages[mb_start:mb_end],
-            log_probs,
-            importance_reweighting_method,
-            mb_old_log_probs,
-            cliprange,
-            response_mask[mb_start:mb_end],
-        )
+            mb_old_log_probs = (
+                old_log_probs[mb_start:mb_end] if old_log_probs is not None else None
+            )
 
-        loss = run_aggregate_loss_across_microbatch(
-            pg_loss,
-            response_mask[mb_start:mb_end],
-            loss_normalization,
-            normalization_constant,
-        )
+            pg_loss, pg_loss_metadata = run_compute_policy_gradient_loss(
+                advantages[mb_start:mb_end],
+                log_probs,
+                importance_reweighting_method,
+                mb_old_log_probs,
+                cliprange,
+                response_mask[mb_start:mb_end],
+            )
 
-        loss = loss / gradient_accumulation_steps
-        loss.backward()
-        total_loss += loss.detach()
+            if tis_weights is not None:
+                pg_loss = pg_loss * tis_weights[mb_start:mb_end]
 
-    grad_norm = None
-    if max_grad_norm is not None:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_grad_norm,
-        )
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+            loss = run_aggregate_loss_across_microbatch(
+                pg_loss,
+                response_mask[mb_start:mb_end],
+                loss_normalization,
+                normalization_constant,
+            )
+
+            loss = loss / gradient_accumulation_steps
+            loss.backward()
+            total_loss += loss.detach()
+
+        grad_norm = None
+        if max_grad_norm is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_grad_norm,
+            )
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        epoch_losses.append(total_loss)
+        epoch_grad_norms.append(grad_norm)
 
     metadata.update(reward_metadata)
     metadata.update(advantages_metadata)
-    metadata["grad_norm"] = grad_norm
+    if tis_weights is not None:
+        masked_tis = tis_weights[response_mask.bool()]
+        metadata["tis_mean"] = masked_tis.mean()
+        metadata["tis_max"] = masked_tis.max()
+        metadata["tis_clip_frac"] = (masked_tis >= tis_clip).float().mean()
+    metadata["epoch_losses"] = epoch_losses
+    # clip_grad_norm_ reports the norm *before* clipping, so these are the honest
+    # gradient magnitudes: any value above max_grad_norm means that step got
+    # rescaled and its size was set by the clip rather than by the loss.
+    metadata["epoch_grad_norms"] = epoch_grad_norms
+    metadata["grad_norm"] = epoch_grad_norms[-1]
 
-    return (total_loss, metadata)
+    return (torch.stack(epoch_losses).mean(), metadata)
 
 
 def run_sft_train_step(
@@ -520,6 +605,7 @@ def run_sft_train_step(
     responses: list[str],
     gradient_accumulation_steps: int,
     max_grad_norm: float | None,
+    epochs: int = 1,
 ):
     tokenizer_outputs = run_tokenize_prompt_and_output(prompts, responses, tokenizer)
     input_ids = tokenizer_outputs["input_ids"]
@@ -529,40 +615,53 @@ def run_sft_train_step(
     batch_size = input_ids.size(0)
     microbatch_size = batch_size // gradient_accumulation_steps
 
-    optimizer.zero_grad(set_to_none=True)
     metadata = {}
+    epoch_losses = []
+    epoch_grad_norms = []
 
-    total_loss = 0.0
-    for mb in range(gradient_accumulation_steps):
-        mb_start = mb * microbatch_size
-        mb_end = mb_start + microbatch_size
+    for _ in range(max(epochs, 1)):
+        optimizer.zero_grad(set_to_none=True)
 
-        mb_input_ids = input_ids[mb_start:mb_end]
-        mb_labels = labels[mb_start:mb_end]
-        mb_mask = response_mask[mb_start:mb_end]
+        total_loss = 0.0
+        for mb in range(gradient_accumulation_steps):
+            mb_start = mb * microbatch_size
+            mb_end = mb_start + microbatch_size
 
-        model_outputs = run_get_response_log_probs(
-            model, mb_input_ids, mb_labels, False
-        )
-        log_probs = model_outputs["log_probs"]
+            mb_input_ids = input_ids[mb_start:mb_end]
+            mb_labels = labels[mb_start:mb_end]
+            mb_mask = response_mask[mb_start:mb_end]
 
-        loss = -log_probs * mb_mask
+            model_outputs = run_get_response_log_probs(
+                model, mb_input_ids, mb_labels, False
+            )
+            log_probs = model_outputs["log_probs"]
 
-        loss = loss.mean() / gradient_accumulation_steps
-        loss.backward()
-        total_loss += loss.detach()
+            loss = -log_probs * mb_mask
 
-    grad_norm = None
-    if max_grad_norm is not None:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_grad_norm,
-        )
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-    metadata["grad_norm"] = grad_norm
+            loss = loss.mean() / gradient_accumulation_steps
+            loss.backward()
+            total_loss += loss.detach()
 
-    return (total_loss, metadata)
+        grad_norm = None
+        if max_grad_norm is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_grad_norm,
+            )
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        epoch_losses.append(total_loss)
+        epoch_grad_norms.append(grad_norm)
+
+    metadata["epoch_losses"] = epoch_losses
+    # clip_grad_norm_ reports the norm *before* clipping, so these are the honest
+    # gradient magnitudes: any value above max_grad_norm means that step got
+    # rescaled and its size was set by the clip rather than by the loss.
+    metadata["epoch_grad_norms"] = epoch_grad_norms
+    metadata["grad_norm"] = epoch_grad_norms[-1]
+
+    return (torch.stack(epoch_losses).mean(), metadata)
 
 
 """

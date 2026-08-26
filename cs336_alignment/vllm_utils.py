@@ -11,7 +11,7 @@ import subprocess
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -23,6 +23,10 @@ class VLLMCompletion:
     text: str
     token_ids: list[int]
     finish_reason: str | None
+    # Only populated when the request asks for logprobs; the eval path does not.
+    token_logprobs: list[float] = field(default_factory=list)
+    prompt_logprobs: list[float] = field(default_factory=list)
+    prompt_token_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -177,6 +181,20 @@ def stop_server(process: subprocess.Popen | None, timeout: int = 30) -> None:
         process.wait()
 
 
+def extract_logprobs(choice, is_extract_logprobs) -> dict[str, list[float]]:
+    if not is_extract_logprobs:
+        return {}
+
+    logprobs = choice.get("logprobs")
+    prompt_logprobs = choice.get("prompt_logprobs")
+    if logprobs is None or logprobs.get("token_logprobs", None) is None or prompt_logprobs is None:
+        return {}
+
+    return {
+        "token_logprobs": logprobs["token_logprobs"],
+        "prompt_logprobs": [list(pl.values())[0]["logprob"] for pl in prompt_logprobs[1:]]
+    }
+
 def generate_completions(
     vllm_base_url: str,
     model_id: str,
@@ -199,12 +217,17 @@ def generate_completions(
             "temperature": sampling_params["temperature"],
             "max_tokens": sampling_params["max_tokens"],
             "n": sampling_params["n"],
-            "seed": sampling_params["seed"],
+            "seed": sampling_params.get("seed"),
             "return_token_ids": True,
         }
         if sampling_params.get("stop") is not None:
             payload["stop"] = sampling_params["stop"]
             payload["include_stop_str_in_output"] = sampling_params.get("include_stop_str_in_output", False)
+
+        is_extract_logprobs = sampling_params.get("logprobs") is not None and sampling_params.get("prompt_logprobs") is not None
+        if is_extract_logprobs:
+            payload["logprobs"] = sampling_params["logprobs"]
+            payload["prompt_logprobs"] = sampling_params["prompt_logprobs"]
 
         response = _http_json("POST", f"{vllm_base_url}/v1/completions", payload, timeout=3600)
         choices = sorted(response["choices"], key=lambda choice: choice["index"])
@@ -213,6 +236,8 @@ def generate_completions(
                 text=choice["text"],
                 token_ids=choice.get("token_ids") or [],
                 finish_reason=choice.get("finish_reason"),
+                prompt_token_ids=choice.get("prompt_token_ids") or [],
+                **extract_logprobs(choice, is_extract_logprobs),
             )
             for choice in choices
         )
