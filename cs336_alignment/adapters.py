@@ -605,7 +605,6 @@ def run_sft_train_step(
     responses: list[str],
     gradient_accumulation_steps: int,
     max_grad_norm: float | None,
-    epochs: int = 1,
 ):
     tokenizer_outputs = run_tokenize_prompt_and_output(prompts, responses, tokenizer)
     input_ids = tokenizer_outputs["input_ids"]
@@ -616,52 +615,40 @@ def run_sft_train_step(
     microbatch_size = batch_size // gradient_accumulation_steps
 
     metadata = {}
-    epoch_losses = []
-    epoch_grad_norms = []
+    optimizer.zero_grad(set_to_none=True)
 
-    for _ in range(max(epochs, 1)):
-        optimizer.zero_grad(set_to_none=True)
+    total_loss = 0.0
+    for mb in range(gradient_accumulation_steps):
+        mb_start = mb * microbatch_size
+        mb_end = mb_start + microbatch_size
 
-        total_loss = 0.0
-        for mb in range(gradient_accumulation_steps):
-            mb_start = mb * microbatch_size
-            mb_end = mb_start + microbatch_size
+        mb_input_ids = input_ids[mb_start:mb_end]
+        mb_labels = labels[mb_start:mb_end]
+        mb_mask = response_mask[mb_start:mb_end]
 
-            mb_input_ids = input_ids[mb_start:mb_end]
-            mb_labels = labels[mb_start:mb_end]
-            mb_mask = response_mask[mb_start:mb_end]
+        model_outputs = run_get_response_log_probs(
+            model, mb_input_ids, mb_labels, False
+        )
+        log_probs = model_outputs["log_probs"]
 
-            model_outputs = run_get_response_log_probs(
-                model, mb_input_ids, mb_labels, False
-            )
-            log_probs = model_outputs["log_probs"]
+        loss = -log_probs * mb_mask
 
-            loss = -log_probs * mb_mask
+        loss = loss.mean() / gradient_accumulation_steps
+        loss.backward()
+        total_loss += loss.detach()
 
-            loss = loss.mean() / gradient_accumulation_steps
-            loss.backward()
-            total_loss += loss.detach()
+    grad_norm = None
+    if max_grad_norm is not None:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_grad_norm,
+        )
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
 
-        grad_norm = None
-        if max_grad_norm is not None:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_grad_norm,
-            )
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+    metadata["grad_norm"] = grad_norm
 
-        epoch_losses.append(total_loss)
-        epoch_grad_norms.append(grad_norm)
-
-    metadata["epoch_losses"] = epoch_losses
-    # clip_grad_norm_ reports the norm *before* clipping, so these are the honest
-    # gradient magnitudes: any value above max_grad_norm means that step got
-    # rescaled and its size was set by the clip rather than by the loss.
-    metadata["epoch_grad_norms"] = epoch_grad_norms
-    metadata["grad_norm"] = epoch_grad_norms[-1]
-
-    return (torch.stack(epoch_losses).mean(), metadata)
+    return (total_loss.mean(), metadata)
 
 
 """

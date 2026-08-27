@@ -16,7 +16,7 @@ set -uo pipefail
 # only accepted "model" value is the full snapshot path, and clients sending the
 # familiar hub id get a 404.
 # MODEL_ID="${MODEL_ID:-/home/zezhen/.cache/huggingface/hub/models--allenai--OLMo-2-0425-1B/snapshots/a1847dff35000b4271fa70afc5db10fd29fedbdf}"
-MODEL_ID="${MODEL_ID:-/home/zezhen/assignment5-alignment/outputs/OLMo-2-0425-1B-sft-v5}"
+MODEL_ID="${MODEL_ID:-/home/zezhen/assignment5-alignment/outputs/OLMo-2-0425-1B-grpo-v4}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-allenai/OLMo-2-0425-1B}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"

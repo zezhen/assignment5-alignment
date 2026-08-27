@@ -65,7 +65,7 @@ def extract_response(example: dict) -> str:
     answer = splits[0]
     final_answer = splits[-1].strip().replace(",", "").strip()
 
-    return f"<think>{answer}</think><answer>{final_answer}</answer>"
+    return f"<think>{answer}</think><answer>{final_answer}</answer><|endoftext|>"
 
 
 def parse_question_only(output: str):
@@ -147,8 +147,23 @@ def reward(prompt_name: str, output: str, gt: str) -> dict[str, float]:
     }
 
 
-def format_grad_norms(grad_norms: list, max_grad_norm: float | None) -> str:
-    """Pre-clip gradient norms, flagged with * where the clip rescaled the step."""
+CLIP_WINDOW = 200
+
+
+def format_grad_norms(
+    grad_norms: list,
+    max_grad_norm: float | None,
+    clip_history: list[float] | None = None,
+) -> str:
+    """Pre-clip gradient norms, flagged with * where the clip rescaled the step.
+
+    Also reports the rescale the clip actually applied, min(1, max_grad_norm/norm).
+    Under AdamW a *constant* rescale cancels exactly out of m/sqrt(v), so the
+    level of that factor costs nothing -- only its variation across steps moves
+    the trajectory. cv (std/mean over the last CLIP_WINDOW steps) is therefore
+    the number that says whether clipping is doing anything: near 0 means it is
+    effectively free, large means the clip is reshaping the update.
+    """
     if not grad_norms or grad_norms[0] is None:
         return "gnorm=off"
 
@@ -157,9 +172,28 @@ def format_grad_norms(grad_norms: list, max_grad_norm: float | None) -> str:
         f"{value:.3f}{'*' if max_grad_norm is not None and value > max_grad_norm else ''}"
         for value in values
     ]
+    summary = f"gnorm={sum(values) / len(values):.3f} [{' '.join(clipped)}]"
 
-    return f"gnorm={sum(values) / len(values):.3f} [{' '.join(clipped)}]"
+    if max_grad_norm is None or clip_history is None:
+        return summary
 
+    clip_history.extend(
+        min(1.0, max_grad_norm / value) if value > 0 else 1.0 for value in values
+    )
+    window = clip_history[-CLIP_WINDOW:]
+    mean = sum(window) / len(window)
+    std = (sum((f - mean) ** 2 for f in window) / len(window)) ** 0.5
+
+    return (
+        f"{summary}, clip={mean:.3f} cv={std / mean if mean else 0.0:.3f} "
+        f"fired={sum(1 for f in window if f < 1.0) / len(window):.2f} n={len(window)}"
+    )
+
+def format_finish_reasons(finish_reasons: Counter) -> str:
+    output = []
+    for item, count in finish_reasons.items():
+        output.append(f"{item}={count}")
+    return ",".join(output)
 
 def category(fmt: int, correct: int):
     if fmt == 1 and correct == 1:
@@ -227,7 +261,7 @@ def evaluate_pass_at_k(
     max_tokens: int,
     temperature: float,
     ks: list[int],
-) -> dict[int, float]:
+) -> tuple[dict[int, float], float]:
     """pass@k on a held-out set, sampled fresh from whatever vLLM is serving.
 
     Sampling temperature has to be > 0: at 0 every one of the k samples is the
@@ -242,8 +276,6 @@ def evaluate_pass_at_k(
             "max_tokens": max_tokens,
             "n": samples,
             "seed": None,
-            "stop": ["</answer>"],
-            "include_stop_str_in_output": True,
         },
     )
     assert len(completions) == len(examples) * samples
@@ -255,8 +287,9 @@ def evaluate_pass_at_k(
         counts.append(
             sum(score(prompt_name, completion.text, gt)["correctness_reward"] for completion in group)
         )
+    response_length = sum([len(completion.token_ids) for completion in completions]) * 1.0 / len(completions)
 
-    return pass_at_k_report(counts, samples, ks)
+    return pass_at_k_report(counts, samples, ks), response_length
 
 
 def run_sft_train(
@@ -271,7 +304,7 @@ def run_sft_train(
     vllm_base_url: str | None,
     batch_index: int,
     weight_sync_group,
-    epochs: int = 1,
+    epoch: int = 1,
 ):
     assert len(prompts) == len(examples)
     responses = [extract_response(example) for example in examples]
@@ -284,13 +317,10 @@ def run_sft_train(
         responses,
         gradient_accumulation_steps,
         max_grad_norm=1.0,
-        epochs=epochs,
     )
 
-    losses = " ".join(f"{loss.item():.4f}" for loss in metadata["epoch_losses"])
-    grads = format_grad_norms(metadata["epoch_grad_norms"], 1.0)
     print(
-        f"sft training batch {batch_index}, loss={total_loss.item():.4f} [{losses}], {grads}"
+        f"sft training batch {batch_index}, epoch={epoch}, loss={total_loss.item():.4f}, grad_norm={metadata["grad_norm"]:.3f}"
     )
 
     if enable_sync_policy_weights:
@@ -298,8 +328,9 @@ def run_sft_train(
 
 def build_grpo_batch(
     completions: list[VLLMCompletion],
+    tokenizer: PreTrainedTokenizerBase,
     device: str = "cuda",
-) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, Counter]:
     """Tokenized batch plus the sampler's own log-probs, built from vLLM's ids.
 
     Re-encoding the decoded text disagrees with the ids vLLM actually sampled on
@@ -309,6 +340,7 @@ def build_grpo_batch(
     every row exactly len(prompt) + len(generated) - 1 by construction.
     """
     rows = []
+    finish_reasons = Counter()
     for completion in completions:
         prompt_ids = list(completion.prompt_token_ids)
         gen_ids = list(completion.token_ids)
@@ -319,6 +351,9 @@ def build_grpo_batch(
         assert len(completion.prompt_logprobs) == len(prompt_ids) - 1
         assert len(completion.token_logprobs) == len(gen_ids)
 
+        if completion.finish_reason == "stop":
+            assert gen_ids[-1] == tokenizer.eos_token_id, f"last token id {tokenizer.decode(gen_ids[-1])} should be EOS"
+
         rows.append(
             (
                 ids[:-1],
@@ -327,6 +362,7 @@ def build_grpo_batch(
                 list(completion.prompt_logprobs) + list(completion.token_logprobs),
             )
         )
+        finish_reasons[completion.finish_reason] += 1
 
     width = max(len(row[0]) for row in rows)
 
@@ -343,7 +379,7 @@ def build_grpo_batch(
         "response_mask": stack(2, 0.0, torch.float),
     }
 
-    return batch, stack(3, 0.0, torch.float)
+    return batch, stack(3, 0.0, torch.float), finish_reasons
 
 def run_grpo_train(
     model: torch.nn.Module,
@@ -362,6 +398,7 @@ def run_grpo_train(
     epochs: int = 1,
     tis_clip: float | None = 2.0,
     pass_ks: list[int] | None = None,
+    clip_history: list[float] | None = None,
     max_grad_norm = 1.0,
 ):
 
@@ -378,7 +415,7 @@ def run_grpo_train(
         len(repeated_prompts) == len(rollout_responses) == len(repeated_ground_truths)
     ), f"{len(repeated_prompts)=}, {len(rollout_responses)=}, {len(repeated_ground_truths)=}"
 
-    batch, vllm_log_probs = build_grpo_batch(completions)
+    batch, vllm_log_probs, finish_reasons = build_grpo_batch(completions, tokenizer)
 
     total_loss, metadata = run_grpo_train_step(
         model=model,
@@ -415,11 +452,16 @@ def run_grpo_train(
         pass_ks or [1],
     )
 
-    grads = format_grad_norms(metadata["epoch_grad_norms"], max_grad_norm)
+    grads = format_grad_norms(
+        metadata["epoch_grad_norms"], max_grad_norm, clip_history
+    )
+    response_length = sum([len(completion.token_ids) for completion in completions]) * 1.0 / len(completions)
 
     print(
         f"grpo training batch {batch_index}, loss={total_loss.item():.4f} [{losses}], "
-        f"reward={metadata['reward_mean']:.4f}{tis}, {format_pass_at_k(passk)}, {grads}"
+        f"reward={metadata['reward_mean']:.4f}{tis}, {format_pass_at_k(passk)}, {grads}, "
+        f"average response length: {response_length:.3f}, "
+        f"completion finish reasons: {format_finish_reasons(finish_reasons)}"
     )
 
     if enable_sync_policy_weights:
@@ -471,6 +513,7 @@ def main():
     parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--sync-policy-weight", type=bool, default=False)
     parser.add_argument("--save", type=bool, default=False)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument(
         "--ref-model",
         default="/home/zezhen/.cache/huggingface/hub/models--allenai--OLMo-2-0425-1B/snapshots/a1847dff35000b4271fa70afc5db10fd29fedbdf",
@@ -531,47 +574,49 @@ def main():
                 weight_sync_group = init_weight_sync(args.base_url, "cuda:0")
 
             pass_ks = [int(k) for k in args.pass_at_k.split(",") if k.strip()]
+            clip_history: list[float] = []
             eval_examples = load_jsonl(GSM8K_TEST)[: args.eval_examples]
 
-            for batch_index, batch_prompts in enumerate(prompt_batches):
-                # Goes through vLLM, so it scores whatever the server is serving:
-                # without --sync-policy-weight this measures the frozen sampler,
-                # not the model being trained.
-                if args.eval_every and batch_index % args.eval_every == 0:
-                    report = evaluate_pass_at_k(
-                        prompt_name=prompt_name,
-                        template=template,
-                        examples=eval_examples,
-                        vllm_base_url=args.base_url,
-                        model_id=args.model,
-                        samples=args.eval_samples,
-                        max_tokens=args.max_tokens,
-                        temperature=args.eval_temperature,
-                        ks=pass_ks,
-                    )
-                    print(
-                        f"eval batch {batch_index} on {len(eval_examples)} held-out "
-                        f"examples x{args.eval_samples}: {format_pass_at_k(report)}"
-                    )
+            if args.sft_training:
+                for epoch in range(max(args.epoches, 1)):
+                    for batch_index, batch_prompts in enumerate(prompt_batches):
+                        run_sft_train(
+                            model,
+                            tokenizer,
+                            optimizer,
+                            prompt_name,
+                            batch_prompts,
+                            data_batches[batch_index],
+                            args.gradient_accumulation_steps,
+                            args.sync_policy_weight,
+                            args.base_url,
+                            batch_index,
+                            weight_sync_group,
+                            epoch=epoch,
+                        )
 
-                if args.sft_training:
-                    run_sft_train(
-                        model,
-                        tokenizer,
-                        optimizer,
-                        prompt_name,
-                        batch_prompts,
-                        data_batches[batch_index],
-                        args.gradient_accumulation_steps,
-                        args.sync_policy_weight,
-                        args.base_url,
-                        batch_index,
-                        weight_sync_group,
-                        epochs=args.epoches,
-                    )
-                    continue
-
-                if args.grpo_training:
+            if args.grpo_training:
+                for batch_index, batch_prompts in enumerate(prompt_batches):
+                    # Goes through vLLM, so it scores whatever the server is serving:
+                    # without --sync-policy-weight this measures the frozen sampler,
+                    # not the model being trained.
+                    if args.eval_every and batch_index % args.eval_every == 0:
+                        report, response_length = evaluate_pass_at_k(
+                            prompt_name=prompt_name,
+                            template=template,
+                            examples=eval_examples,
+                            vllm_base_url=args.base_url,
+                            model_id=args.model,
+                            samples=args.eval_samples,
+                            max_tokens=args.max_tokens,
+                            temperature=args.eval_temperature,
+                            ks=pass_ks,
+                        )
+                        print(
+                            f"eval batch {batch_index} on {len(eval_examples)} held-out "
+                            f"examples {args.eval_samples}: {format_pass_at_k(report)}, "
+                            f"average response length: {response_length:.3f}"
+                        )
                     completions: list[VLLMCompletion] = generate_completions(
                         vllm_base_url=args.base_url,
                         model_id=args.model,
@@ -583,8 +628,6 @@ def main():
                             "seed": None,
                             "logprobs": 0,
                             "prompt_logprobs": 0,
-                            "stop": ["</answer>"],
-                            "include_stop_str_in_output": True,
                         },
                     )
 
@@ -605,6 +648,8 @@ def main():
                         epochs=args.epoches,
                         tis_clip=args.tis_clip,
                         pass_ks=pass_ks,
+                        clip_history=clip_history,
+                        max_grad_norm=args.max_grad_norm,
                     )
 
             if args.save:
